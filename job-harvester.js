@@ -1,392 +1,337 @@
 #!/usr/bin/env node
 'use strict';
 
-/**
- * Jobs4Youth Opportunity Harvester
- *
- * Production-safe first version:
- * - Imports jobs from the official ReliefWeb API v2.
- * - Supports optional authorised JSON feeds through HARVESTER_JSON_FEEDS.
- * - Normalises records to the public.opportunities schema.
- * - Upserts through the Supabase REST API using source_type + external_id.
- * - Supports dry runs and avoids HTML scraping.
- *
- * Required environment variables:
- *   SUPABASE_URL=https://YOUR_PROJECT.supabase.co
- *   SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
- *   RELIEFWEB_APPNAME=jobs4youth.org
- *
- * Optional environment variables:
- *   HARVEST_DRY_RUN=true
- *   HARVEST_LIMIT=100
- *   HARVEST_DAYS_BACK=14
- *   HARVEST_COUNTRIES=Malawi,Kenya,Uganda,Tanzania,Rwanda,Zambia,Zimbabwe,Mozambique,Ethiopia,Nigeria,Ghana,Remote
- *   HARVEST_STATUS=Verified
- *   HARVESTER_JSON_FEEDS=[{"name":"Partner Feed","url":"https://partner.example/jobs.json","token":"..."}]
- */
+/*
+  Jobs4Youth Malawi Job Harvester
+  - Collects public Malawi job listing links from CareerAd Malawi and Malawi Living Hub.
+  - Reads JobPosting structured data when a source publishes it.
+  - Stores a short summary and ALWAYS links users back to the original source.
+  - Does not copy full vacancy text.
+  - Uses no npm packages. Node.js 20+ only.
+*/
 
-const CONFIG = {
-  supabaseUrl: cleanUrl(process.env.SUPABASE_URL || ''),
-  serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
-  reliefWebAppName: process.env.RELIEFWEB_APPNAME || 'jobs4youth.org',
-  dryRun: String(process.env.HARVEST_DRY_RUN || 'false').toLowerCase() === 'true',
-  limit: clampNumber(process.env.HARVEST_LIMIT, 100, 1, 500),
-  daysBack: clampNumber(process.env.HARVEST_DAYS_BACK, 14, 1, 90),
-  defaultStatus: process.env.HARVEST_STATUS || 'Verified',
-  countries: parseCsv(process.env.HARVEST_COUNTRIES || 'Malawi,Kenya,Uganda,Tanzania,Rwanda,Zambia,Zimbabwe,Mozambique,Ethiopia,Nigeria,Ghana,Sierra Leone,Liberia,Senegal,Côte d’Ivoire,South Africa,Remote'),
-  jsonFeeds: parseJsonFeeds(process.env.HARVESTER_JSON_FEEDS || '[]')
-};
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+const DRY_RUN = String(process.env.HARVEST_DRY_RUN || 'false').toLowerCase() === 'true';
+const MAX_JOBS = Math.max(1, Math.min(100, Number(process.env.HARVEST_LIMIT || 50)));
 
-const AFRICAN_COUNTRIES = new Set([
-  'Algeria','Angola','Benin','Botswana','Burkina Faso','Burundi','Cabo Verde','Cameroon',
-  'Central African Republic','Chad','Comoros','Congo','Democratic Republic of the Congo',
-  "Côte d’Ivoire",'Djibouti','Egypt','Equatorial Guinea','Eritrea','Eswatini','Ethiopia',
-  'Gabon','Gambia','Ghana','Guinea','Guinea-Bissau','Kenya','Lesotho','Liberia','Libya',
-  'Madagascar','Malawi','Mali','Mauritania','Mauritius','Morocco','Mozambique','Namibia',
-  'Niger','Nigeria','Rwanda','Sao Tome and Principe','Senegal','Seychelles','Sierra Leone',
-  'Somalia','South Africa','South Sudan','Sudan','Tanzania','Togo','Tunisia','Uganda',
-  'Zambia','Zimbabwe'
-]);
-
-function cleanUrl(value) {
-  return String(value || '').replace(/\/+$/, '');
-}
-
-function clampNumber(value, fallback, min, max) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.floor(parsed))) : fallback;
-}
-
-function parseCsv(value) {
-  return String(value || '').split(',').map(v => v.trim()).filter(Boolean);
-}
-
-function parseJsonFeeds(value) {
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed.filter(x => x && x.name && x.url) : [];
-  } catch (error) {
-    console.warn('HARVESTER_JSON_FEEDS is invalid JSON; optional partner feeds are disabled.');
-    return [];
+const SOURCES = [
+  {
+    name: 'CareerAd Malawi',
+    listUrls: [
+      'https://www.careeradmw.com/jobs',
+      'https://www.careeradmw.com/jobs?page=2',
+      'https://www.careeradmw.com/jobs?page=3'
+    ],
+    jobUrlPattern: /^https:\/\/www\.careeradmw\.com\/jobs\/[a-z0-9-]+\/?$/i
+  },
+  {
+    name: 'Malawi Living Hub',
+    listUrls: ['https://malawilivinghub.com/jobs'],
+    jobUrlPattern: /^https:\/\/malawilivinghub\.com\/jobs\/[a-z0-9-]+\/?$/i
   }
-}
+];
 
 function stripHtml(value) {
   return String(value || '')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
+    .replace(/<[^>]*>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
+    .replace(/&#39;|&apos;/gi, "'")
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+function decodeJsonLd(value) {
+  return String(value || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;/g, "'");
+}
+
+function toAbsoluteUrl(href, baseUrl) {
+  try {
+    return new URL(href, baseUrl).href.split('#')[0];
+  } catch {
+    return '';
+  }
+}
+
 function isoDate(value) {
   if (!value) return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
 }
 
-function isoTimestamp(value) {
-  const date = value ? new Date(value) : new Date();
-  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+function isoTime(value) {
+  const d = value ? new Date(value) : new Date();
+  return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 }
 
-function first(items, fallback = '') {
-  return Array.isArray(items) && items.length ? items[0] : fallback;
+function slugFromUrl(url) {
+  try {
+    return new URL(url).pathname.split('/').filter(Boolean).pop() || url;
+  } catch {
+    return url;
+  }
 }
 
-function names(items) {
-  return (Array.isArray(items) ? items : [])
-    .map(item => typeof item === 'string' ? item : item?.name)
-    .filter(Boolean);
+function titleFromSlug(slug) {
+  return String(slug || '')
+    .replace(/-[a-z0-9]{6,10}$/i, '')
+    .replace(/-\d{8,}$/g, '')
+    .replace(/-/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase())
+    .trim();
 }
 
-function inferCategory(title, careerCategories = []) {
-  const text = `${title || ''} ${careerCategories.join(' ')}`.toLowerCase();
+function inferCategory(title) {
+  const text = String(title || '').toLowerCase();
+  if (/internship|\bintern\b/.test(text)) return 'Internship';
   if (/scholarship|studentship/.test(text)) return 'Scholarship';
-  if (/fellowship|fellow\b/.test(text)) return 'Fellowship';
-  if (/internship|intern\b/.test(text)) return 'Internship';
-  if (/apprentice/.test(text)) return 'Apprenticeship';
+  if (/fellowship|\bfellow\b/.test(text)) return 'Fellowship';
   if (/volunteer/.test(text)) return 'Volunteer';
-  if (/consultan/.test(text)) return 'Job';
+  if (/apprentice/.test(text)) return 'Apprenticeship';
+  if (/training|course|bootcamp/.test(text)) return 'Training';
   return 'Job';
 }
 
-function inferExperience(experienceNames = [], title = '') {
-  const text = `${experienceNames.join(' ')} ${title}`.toLowerCase();
-  if (/0.?2|entry|intern|graduate|junior/.test(text)) return 'Entry Level';
-  if (/3.?4|3.?5|mid/.test(text)) return '3–5 Years';
-  if (/5|6|7|8|9|10|senior|director|head|lead/.test(text)) return '5+ Years';
-  return '';
+function locationFromJson(value) {
+  const locations = Array.isArray(value) ? value : value ? [value] : [];
+  const first = locations[0] || {};
+  const address = first.address || first.location?.address || {};
+  const region = address.addressLocality || address.addressRegion || '';
+  const countryValue = address.addressCountry;
+  const country = typeof countryValue === 'string'
+    ? countryValue
+    : countryValue?.name || 'Malawi';
+  return { region, country: /malawi|mw/i.test(country) ? 'Malawi' : country };
 }
 
-function inferEducation(description = '') {
-  const text = String(description).toLowerCase();
-  if (/ph\.?d|doctorate/.test(text)) return 'PhD';
-  if (/master'?s|msc|ma degree/.test(text)) return "Master's Degree";
-  if (/bachelor'?s|undergraduate degree|bsc|ba degree/.test(text)) return "Bachelor's Degree";
-  if (/diploma/.test(text)) return 'Diploma';
-  if (/certificate/.test(text)) return 'Certificate';
-  return '';
+function organizationFromJson(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  return value.name || value.legalName || '';
 }
 
-function inferSkills(description = '', categories = []) {
-  const known = [
-    'Data Analysis','Data Science','Python','SQL','Power BI','Monitoring and Evaluation',
-    'Project Management','Research','Statistics','Economics','Agriculture','Agribusiness',
-    'Communications','Finance','Human Resources','Logistics','Procurement','Public Health',
-    'Climate Change','Food Security','GIS','Machine Learning'
-  ];
-  const text = `${description} ${categories.join(' ')}`.toLowerCase();
-  const detected = known.filter(skill => text.includes(skill.toLowerCase()));
-  return [...new Set([...detected, ...categories])].slice(0, 15).join(', ');
+function extractJsonLd(html) {
+  const blocks = [];
+  const regex = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = regex.exec(html))) {
+    try {
+      const parsed = JSON.parse(decodeJsonLd(match[1]).trim());
+      blocks.push(parsed);
+    } catch {
+      // Ignore malformed structured data and use the safe fallback.
+    }
+  }
+  return blocks;
 }
 
-function locationFromReliefWeb(fields) {
-  const countryNames = names(fields.country);
-  const city = first(names(fields.city));
-  const country = countryNames[0] || (fields.remote ? 'Remote' : '');
-  return { country, region: city || '' };
-}
-
-function relevantToConfiguredCountries(country, description = '') {
-  if (!CONFIG.countries.length) return true;
-  if (country === 'Remote') return true;
-  if (CONFIG.countries.includes(country)) return true;
-  const lower = String(description).toLowerCase();
-  return CONFIG.countries.some(item => lower.includes(item.toLowerCase()));
-}
-
-function normalizeReliefWeb(item) {
-  const fields = item?.fields || {};
-  const title = fields.title || `ReliefWeb opportunity ${item?.id || ''}`;
-  const description = stripHtml(fields.body || fields.description || '');
-  const careerCategories = names(fields['career_categories'] || fields.career_categories);
-  const experienceNames = names(fields.experience);
-  const organisations = names(fields.source);
-  const location = locationFromReliefWeb(fields);
-  const sourceUrl = fields.url || `https://reliefweb.int/job/${item.id}`;
-  const deadline = isoDate(fields.date?.closing || fields.date?.deadline);
-  const createdAt = isoTimestamp(fields.date?.created || fields.date?.original || new Date());
-
-  return {
-    posted_by: null,
-    title,
-    organization_name: organisations.join(', ') || 'ReliefWeb-listed organisation',
-    country: location.country,
-    region: location.region,
-    opportunity_type: inferCategory(title, careerCategories),
-    opportunity_category: inferCategory(title, careerCategories),
-    education_requirement: inferEducation(description),
-    experience_requirement: inferExperience(experienceNames, title),
-    deadline,
-    expiry_date: deadline,
-    compensation: null,
-    work_arrangement: location.country === 'Remote' ? 'Remote' : null,
-    duration: '',
-    required_skills: inferSkills(description, careerCategories),
-    benefits: null,
-    learning_outcomes: null,
-    application_link: sourceUrl,
-    description: description.slice(0, 12000) || `See the original listing on ReliefWeb: ${sourceUrl}`,
-    status: CONFIG.defaultStatus,
-    source_name: 'ReliefWeb',
-    source_type: 'reliefweb_api',
-    source_url: sourceUrl,
-    external_id: String(item.id),
-    imported: true,
-    fetched_at: new Date().toISOString(),
-    created_at: createdAt,
-    updated_at: new Date().toISOString()
+function flattenJsonLd(nodes) {
+  const out = [];
+  const visit = node => {
+    if (!node) return;
+    if (Array.isArray(node)) return node.forEach(visit);
+    if (typeof node !== 'object') return;
+    out.push(node);
+    if (Array.isArray(node['@graph'])) node['@graph'].forEach(visit);
   };
+  nodes.forEach(visit);
+  return out;
 }
 
-async function fetchJson(url, options = {}, timeoutMs = 30000) {
+function findJobPosting(html) {
+  return flattenJsonLd(extractJsonLd(html)).find(node => {
+    const type = node['@type'];
+    return type === 'JobPosting' || (Array.isArray(type) && type.includes('JobPosting'));
+  }) || null;
+}
+
+function metaContent(html, key, attribute = 'property') {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = [
+    new RegExp(`<meta[^>]+${attribute}=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, 'i'),
+    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+${attribute}=["']${escaped}["'][^>]*>`, 'i')
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match) return stripHtml(match[1]);
+  }
+  return '';
+}
+
+function pageTitle(html, url) {
+  const og = metaContent(html, 'og:title');
+  if (og) return og.replace(/\s*[|–-]\s*CareerAd.*$/i, '').replace(/\s*[|–-]\s*Malawi Living Hub.*$/i, '').trim();
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return match ? stripHtml(match[1]).split('|')[0].trim() : titleFromSlug(slugFromUrl(url));
+}
+
+function uniqueId(sourceName, url) {
+  return `${sourceName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}:${slugFromUrl(url)}`;
+}
+
+function shortSummary(description, sourceName) {
+  const clean = stripHtml(description);
+  const summary = clean ? clean.slice(0, 650) : 'Open the original source listing to read the full vacancy details and application instructions.';
+  return `${summary}${summary.endsWith('.') ? '' : '.'} Source: ${sourceName}. Always verify the deadline and application instructions on the original listing.`;
+}
+
+async function fetchText(url, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    const text = await response.text();
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 500)}`);
-    return text ? JSON.parse(text) : null;
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'accept': 'text/html,application/xhtml+xml',
+        'accept-language': 'en-GB,en;q=0.9',
+        'user-agent': 'Mozilla/5.0 (compatible; Jobs4YouthBot/1.0; +https://www.jobs4youth.org)'
+      }
+    });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    return await response.text();
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function harvestReliefWeb() {
-  const cutoff = new Date(Date.now() - CONFIG.daysBack * 86400000).toISOString();
-  const endpoint = `https://api.reliefweb.int/v2/jobs?appname=${encodeURIComponent(CONFIG.reliefWebAppName)}`;
-  const body = {
-    limit: CONFIG.limit,
-    offset: 0,
-    fields: {
-      include: [
-        'title','body','url','source','country','city','career_categories','experience',
-        'date.created','date.original','date.closing'
-      ]
-    },
-    filter: {
-      field: 'date.created',
-      value: { from: cutoff }
-    },
-    sort: ['date.created:desc']
-  };
-
-  const payload = await fetchJson(endpoint, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'user-agent': 'Jobs4Youth-Harvester/1.0' },
-    body: JSON.stringify(body)
-  });
-
-  const records = (payload?.data || []).map(normalizeReliefWeb);
-  return records.filter(record =>
-    record.title && record.external_id &&
-    relevantToConfiguredCountries(record.country, `${record.title} ${record.description}`)
-  );
+function extractJobLinks(html, listUrl, source) {
+  const links = new Set();
+  const regex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>/gi;
+  let match;
+  while ((match = regex.exec(html))) {
+    const url = toAbsoluteUrl(match[1], listUrl).replace(/\/$/, '');
+    if (source.jobUrlPattern.test(url)) links.add(url);
+  }
+  return [...links];
 }
 
-function normalizePartnerRecord(item, feed) {
-  const title = item.title || item.name || '';
-  const deadline = isoDate(item.deadline || item.expiry_date || item.closing_date);
-  const description = stripHtml(item.description || item.body || item.summary || '');
-  const sourceUrl = item.url || item.source_url || item.application_link || '';
-  const externalId = String(item.external_id || item.id || sourceUrl || title).trim();
-  const category = item.opportunity_category || item.opportunity_type || inferCategory(title);
+function normalizeJob(html, url, source) {
+  const job = findJobPosting(html);
+  const title = stripHtml(job?.title || job?.name || pageTitle(html, url));
+  const location = locationFromJson(job?.jobLocation || job?.applicantLocationRequirements);
+  const category = inferCategory(title);
+  const deadline = isoDate(job?.validThrough);
+  const posted = isoTime(job?.datePosted);
+  const organisation = organizationFromJson(job?.hiringOrganization) || 'See original source';
+  const description = shortSummary(job?.description || metaContent(html, 'og:description') || metaContent(html, 'description', 'name'), source.name);
 
   return {
     posted_by: null,
     title,
-    organization_name: item.organization_name || item.organization || feed.name,
-    country: item.country || '',
-    region: item.region || item.city || '',
+    organization_name: organisation,
+    country: 'Malawi',
+    region: location.region || '',
     opportunity_type: category,
     opportunity_category: category,
-    education_requirement: item.education_requirement || inferEducation(description),
-    experience_requirement: item.experience_requirement || '',
+    education_requirement: '',
+    experience_requirement: '',
     deadline,
     expiry_date: deadline,
-    compensation: item.compensation || null,
-    work_arrangement: item.work_arrangement || null,
-    duration: item.duration || '',
-    required_skills: Array.isArray(item.required_skills) ? item.required_skills.join(', ') : (item.required_skills || inferSkills(description)),
-    benefits: item.benefits || null,
-    learning_outcomes: item.learning_outcomes || null,
-    application_link: item.application_link || sourceUrl,
-    description: description.slice(0, 12000),
-    status: item.status || CONFIG.defaultStatus,
-    source_name: feed.name,
-    source_type: feed.type || 'partner_json_feed',
-    source_url: sourceUrl,
-    external_id: externalId,
+    compensation: null,
+    work_arrangement: /remote|telecommute/i.test(`${job?.jobLocationType || ''} ${description}`) ? 'Remote' : null,
+    duration: '',
+    required_skills: '',
+    benefits: null,
+    learning_outcomes: null,
+    application_link: url,
+    description,
+    status: 'Verified',
+    source_name: source.name,
+    source_type: 'malawi_public_listing',
+    source_url: url,
+    external_id: uniqueId(source.name, url),
     imported: true,
     fetched_at: new Date().toISOString(),
-    created_at: isoTimestamp(item.created_at || item.published_at || new Date()),
+    created_at: posted,
     updated_at: new Date().toISOString()
   };
 }
 
-async function harvestPartnerFeed(feed) {
-  const headers = { accept: 'application/json', 'user-agent': 'Jobs4Youth-Harvester/1.0' };
-  if (feed.token) headers.authorization = `Bearer ${feed.token}`;
-  const payload = await fetchJson(feed.url, { headers });
-  const items = Array.isArray(payload) ? payload : (payload?.data || payload?.items || payload?.jobs || []);
-  if (!Array.isArray(items)) throw new Error(`${feed.name} did not return an array or a recognised data/items/jobs array.`);
-  return items
-    .map(item => normalizePartnerRecord(item, feed))
-    .filter(record => record.title && record.external_id && relevantToConfiguredCountries(record.country, `${record.title} ${record.description}`));
-}
-
-function deduplicate(records) {
-  const map = new Map();
-  for (const record of records) {
-    const key = `${record.source_type}::${record.external_id}`;
-    map.set(key, record);
+async function harvestSource(source) {
+  const links = new Set();
+  for (const listUrl of source.listUrls) {
+    const html = await fetchText(listUrl);
+    extractJobLinks(html, listUrl, source).forEach(url => links.add(url));
   }
-  return [...map.values()];
+
+  const selected = [...links].slice(0, MAX_JOBS);
+  const jobs = [];
+  for (const url of selected) {
+    try {
+      const html = await fetchText(url);
+      const job = normalizeJob(html, url, source);
+      if (job.title && job.source_url) jobs.push(job);
+    } catch (error) {
+      console.warn(`[${source.name}] Skipped ${url}: ${error.message}`);
+    }
+  }
+  return jobs;
 }
 
-async function upsertSupabase(records) {
-  if (!records.length) return { written: 0 };
-  if (CONFIG.dryRun) {
+async function supabaseUpsert(records) {
+  if (!records.length) return 0;
+  if (DRY_RUN) {
     console.log(JSON.stringify(records.slice(0, 5), null, 2));
-    return { written: 0 };
+    return 0;
   }
-  if (!CONFIG.supabaseUrl || !CONFIG.serviceRoleKey) {
-    throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required unless HARVEST_DRY_RUN=true.');
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY GitHub secret.');
   }
 
-  const batchSize = 100;
-  let written = 0;
-  for (let i = 0; i < records.length; i += batchSize) {
-    const batch = records.slice(i, i + batchSize);
-    await fetchJson(
-      `${CONFIG.supabaseUrl}/rest/v1/opportunities?on_conflict=source_type,external_id`,
-      {
-        method: 'POST',
-        headers: {
-          apikey: CONFIG.serviceRoleKey,
-          authorization: `Bearer ${CONFIG.serviceRoleKey}`,
-          'content-type': 'application/json',
-          prefer: 'resolution=merge-duplicates,return=minimal'
-        },
-        body: JSON.stringify(batch)
-      }
-    );
-    written += batch.length;
-  }
-  return { written };
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/opportunities?on_conflict=source_type,external_id`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'content-type': 'application/json',
+      prefer: 'resolution=merge-duplicates,return=minimal'
+    },
+    body: JSON.stringify(records)
+  });
+
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Supabase ${response.status}: ${text}`);
+  return records.length;
 }
 
 async function main() {
-  const startedAt = new Date();
-  const all = [];
+  console.log(`[Jobs4Youth] Malawi harvest started. Mode: ${DRY_RUN ? 'DRY RUN' : 'WRITE'}`);
+  const allJobs = [];
   const failures = [];
 
-  console.log(`[Jobs4Youth] Harvest started ${startedAt.toISOString()}`);
-  console.log(`[Jobs4Youth] Mode: ${CONFIG.dryRun ? 'DRY RUN' : 'WRITE'}`);
-
-  try {
-    const reliefWeb = await harvestReliefWeb();
-    all.push(...reliefWeb);
-    console.log(`[ReliefWeb] Normalised ${reliefWeb.length} relevant records.`);
-  } catch (error) {
-    failures.push({ source: 'ReliefWeb', error: error.message });
-    console.error(`[ReliefWeb] ${error.message}`);
-  }
-
-  for (const feed of CONFIG.jsonFeeds) {
+  for (const source of SOURCES) {
     try {
-      const records = await harvestPartnerFeed(feed);
-      all.push(...records);
-      console.log(`[${feed.name}] Normalised ${records.length} relevant records.`);
+      const jobs = await harvestSource(source);
+      allJobs.push(...jobs);
+      console.log(`[${source.name}] Found ${jobs.length} Malawi listings.`);
     } catch (error) {
-      failures.push({ source: feed.name, error: error.message });
-      console.error(`[${feed.name}] ${error.message}`);
+      failures.push({ source: source.name, error: error.message });
+      console.error(`[${source.name}] ${error.message}`);
     }
   }
 
-  const records = deduplicate(all);
-  const result = await upsertSupabase(records);
-  const summary = {
-    started_at: startedAt.toISOString(),
-    finished_at: new Date().toISOString(),
-    dry_run: CONFIG.dryRun,
-    normalised: all.length,
-    unique: records.length,
-    written: result.written,
+  const deduped = [...new Map(allJobs.map(job => [`${job.source_type}:${job.external_id}`, job])).values()];
+  const written = await supabaseUpsert(deduped);
+
+  console.log(JSON.stringify({
+    country: 'Malawi',
+    found: allJobs.length,
+    unique: deduped.length,
+    written,
     failures
-  };
-  console.log('[Jobs4Youth] Summary');
-  console.log(JSON.stringify(summary, null, 2));
-  if (failures.length && !records.length) process.exitCode = 1;
+  }, null, 2));
+
+  if (!deduped.length) process.exitCode = 1;
 }
 
 main().catch(error => {
-  console.error('[Jobs4Youth] Fatal:', error);
+  console.error('[Jobs4Youth] Fatal:', error.message);
   process.exitCode = 1;
 });
