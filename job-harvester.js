@@ -6,7 +6,6 @@
   - Collects public Malawi job listing links from CareerAd Malawi and Malawi Living Hub.
   - Reads JobPosting structured data when a source publishes it.
   - Stores a short summary and ALWAYS links users back to the original source.
-  - Does not copy full vacancy text.
   - Uses no npm packages. Node.js 20+ only.
 */
 
